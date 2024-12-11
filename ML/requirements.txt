@@ -1,0 +1,5 @@
+#python 3.8.20
+numpy
+tensorflow==2.10
+deepface
+ultralytics
