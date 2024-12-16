@@ -7,6 +7,13 @@ import numpy as np
 from io import BytesIO
 from scipy.spatial.distance import cosine
 from concurrent.futures import ThreadPoolExecutor
+from ultralytics import YOLO
+from deepface.DeepFace import represent
+
+
+
+model = YOLO("model.pt")
+
 
 app = FastAPI()
 
@@ -20,10 +27,16 @@ class FaceMatchingRequest(BaseModel):
 
 
 def localize_faces_func(image):
-    return [(50, 50, 100, 100)]
+    results = model.predict(source=image, conf=0.25)
+    face_boxes = []
+    for box in results[0].boxes.xyxy:
+        x1, y1, x2, y2 = map(int, box)
+        face_boxes.append((x1, y1, x2, y2))
+    return face_boxes
 
 def extract_features_func(face_image):
-    return np.random.rand(128)
+    result = represent(face_image, model_name="VGG-Face", enforce_detection=False,align=True)
+    return(result[0])
 
 
 def process_image(file_key, s3_client, bucket_name, feature_dict, similarity_threshold):
@@ -40,13 +53,14 @@ def process_image(file_key, s3_client, bucket_name, feature_dict, similarity_thr
             x, y, w, h = box
             face_image = image[y:y+h, x:x+w]
             face_vector = extract_features_func(face_image)
+            maxsim=0
+            winperson=0
             for known_vector, person_id in feature_dict.items():
                 similarity = 1 - cosine(face_vector, known_vector)
                 if similarity >= similarity_threshold:
-                    if person_id not in image_matches:
-                        image_matches[person_id] = []
-                    image_matches[person_id].append(file_key)
-
+                    if maxsim<similarity:
+                        winperson=person_id
+            image_matches[winperson].append(file_key)
         return image_matches
 
     except Exception as e:
