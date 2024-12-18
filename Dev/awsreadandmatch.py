@@ -15,7 +15,9 @@ from deepface.DeepFace import represent
 import base64
 import io
 from sklearn.cluster import MiniBatchKMeans
-
+import bcrypt
+import jwt
+from datetime import datetime, timedelta
 
 
 kmeans = MiniBatchKMeans(n_clusters=3, random_state=42, batch_size=100)
@@ -24,9 +26,22 @@ client = MongoClient("mongodb+srv://anirvesh:anirvesh@cluster0.tuw5ikl.mongodb.n
 db = client["image_database"]
 feature_vector_collection = db["image_feature_vectors"]
 cluster_means_collection = db["cluster_means"]
-
-
+users_collection = db["users"]
 model = YOLO("model.pt")
+SECRET_KEY = "your_secret_key_here"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+
+class RegisterUser(BaseModel):
+    name: str
+    email: str
+    password: str
+    image: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
 class FaceMatchingRequest(BaseModel):
     aws_access_key: str
@@ -206,3 +221,58 @@ async def upload_images(data: ImageData):
         "message": "Images processed, clustered, and data stored successfully",
         "stored_data": stored_data
     }
+
+
+
+@app.post("/register")
+def register_user(user: RegisterUser):
+
+    if users_collection.find_one({"email": user.email}):
+        raise HTTPException(status_code=400, detail="Email already registered.")
+
+    user_data = {
+        "name": user.name,
+        "email": user.email,
+        "password": user.password,
+        "image": user.image,
+    }
+    result = users_collection.insert_one(user_data)
+    return {
+        "id": str(result.inserted_id),
+        "name": user.name,
+        "email": user.email,
+    }
+
+
+def create_access_token(data: dict, expires_delta: timedelta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + expires_delta
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+
+@app.post("/login")
+async def login(request: LoginRequest):
+    user = users_collection.find_one({"email": request.email})
+    
+    if user is None:
+        raise HTTPException(status_code=400, detail="Invalid email or password")
+    
+    if not bcrypt.checkpw(request.password.encode('utf-8'), user["password"].encode('utf-8')):
+        raise HTTPException(status_code=400, detail="Invalid email or password")
+    
+    access_token = create_access_token(data={"sub": user["email"]})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/protected")
+async def protected_route(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {"message": f"Hello {email}, you're authenticated!"}
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
