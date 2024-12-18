@@ -22,16 +22,14 @@ def upload_images_via_paths(paths, base_url):
     payload = {"base64_images": base64_images}
     try:
         response = requests.post(f"{base_url}/upload_images", json=payload)
-        response.raise_for_status()
+        #response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
         print(f"Request failed: {e}")
-        return {"error": str(e)}
+        return {"error ": str(e)}
     
 if __name__ == "__main__":
     image_paths = [r"C:\Users\setya\Documents\Code\SnapSort\ML\guest3.jpg", r"C:\Users\setya\Documents\Code\SnapSort\ML\guestar2.jpg", r"C:\Users\setya\Documents\Code\SnapSort\ML\guestl1.jpg"]
     fastapi_base_url = "http://127.0.0.1:8000"
-
-    print("I am fine till here")
     result = upload_images_via_paths(image_paths,fastapi_base_url)
     print(result)

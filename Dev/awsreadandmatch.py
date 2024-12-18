@@ -45,7 +45,7 @@ def localize_faces_func(image):
 
 def extract_features_func(face_image):
     result = represent(face_image, model_name="VGG-Face", enforce_detection=False,align=True)
-    return(result[0])
+    return(result[0]["embedding"])
 
 
 def process_image(file_key, feature_dict, similarity_threshold):
@@ -197,6 +197,8 @@ async def match_faces(request: FaceMatchingRequest):
 async def upload_images(data: ImageData):
     if not data.base64_images:
         raise HTTPException(status_code=400, detail="No images provided")
+    else:
+        print("data recieved")
     stored_data = []
 
     try:
@@ -218,7 +220,8 @@ async def upload_images(data: ImageData):
                 
                 if image is None:
                     raise ValueError("Invalid image data")
-                feature_vector = extract_features_func(image).tolist()
+                
+                feature_vector = extract_features_func(image)
                 new_feature_vectors.append(feature_vector)
 
                 unique_id = str(uuid4())
