@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import boto3
-from botocore.exceptions import NoCredentialsError
+
 import cv2
 import numpy as np
 from io import BytesIO
@@ -96,12 +95,13 @@ async def match_faces(request: FaceMatchingRequest):
     try:
         feature_vector_collection_as_dict = {}
         for document in feature_vector_collection.find():
+            print(document)
             feature_vector = tuple(document["feature_vector"])
             unique_id = document["unique_id"]
             cluster_number = document["cluster"]
             feature_vector_collection_as_dict[feature_vector] = (unique_id, cluster_number)
 
-        local_directory_path = "/path/to/local/images"
+        local_directory_path = "queue"
         image_files = [
             os.path.join(local_directory_path, file)
             for file in os.listdir(local_directory_path)
@@ -130,6 +130,69 @@ async def match_faces(request: FaceMatchingRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
+# @app.post("/upload_images")
+# async def upload_images(data: ImageData):
+#     if not data.base64_images:
+#         raise HTTPException(status_code=400, detail="No images provided")
+#     stored_data = []
+
+#     try:
+#         all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
+#         feature_vectors = [record["feature_vector"] for record in all_records]
+#         unique_ids = [record["unique_id"] for record in all_records]
+
+#         new_feature_vectors = []
+#         for base64_str in data.base64_images:
+#             image_data = base64.b64decode(base64_str)
+#             np_image = np.frombuffer(image_data, dtype=np.uint8)
+#             image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
+            
+#             if image is None:
+#                 raise ValueError("Invalid image data")
+#             feature_vector = extract_features_func(image).tolist()
+#             new_feature_vectors.append(feature_vector)
+
+#             unique_id = str(uuid4())
+#             unique_ids.append(unique_id)
+#             record = {"feature_vector": feature_vector, "unique_id": unique_id}
+#             stored_data.append(record)
+#         feature_vectors.extend(new_feature_vectors)
+#         kmeans.partial_fit(feature_vectors)
+#         cluster_labels = kmeans.predict(feature_vectors)
+
+#         for i, unique_id in enumerate(unique_ids):
+#             feature_vector_collection.update_one(
+#                 {"unique_id": unique_id},
+#                 {"$set": {"cluster": int(cluster_labels[i])}},
+#                 upsert=True
+#             )
+
+#         for record, cluster_label in zip(stored_data, cluster_labels[-len(new_feature_vectors):]):
+#             record["cluster"] = int(cluster_label)
+#         cluster_vectors = {i: [] for i in range(kmeans.n_clusters)}
+#         for vector, label in zip(feature_vectors, cluster_labels):
+#             cluster_vectors[label].append(vector)
+
+#         mean_vectors = {}
+#         for cluster, vectors in cluster_vectors.items():
+#             if vectors:
+#                 mean_vector = np.mean(vectors, axis=0).tolist()
+#                 mean_vectors[cluster] = mean_vector
+#                 cluster_means_collection.update_one(
+#                     {"cluster": cluster},
+#                     {"$set": {"mean_feature_vector": mean_vector}},
+#                     upsert=True
+#                 )
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error processing images: {str(e)}")
+
+#     return {
+#         "message": "Images processed, clustered, and data stored successfully",
+#         "stored_data": stored_data
+#     }
+
+
 @app.post("/upload_images")
 async def upload_images(data: ImageData):
     if not data.base64_images:
@@ -137,55 +200,72 @@ async def upload_images(data: ImageData):
     stored_data = []
 
     try:
-        all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
-        feature_vectors = [record["feature_vector"] for record in all_records]
-        unique_ids = [record["unique_id"] for record in all_records]
+        # Step 1: Fetch existing records from the database
+        try:
+            all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
+            feature_vectors = [record["feature_vector"] for record in all_records]
+            unique_ids = [record["unique_id"] for record in all_records]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error fetching records from database: {str(e)}")
 
+        # Step 2: Process incoming images
         new_feature_vectors = []
         for base64_str in data.base64_images:
-            image_data = base64.b64decode(base64_str)
-            np_image = np.frombuffer(image_data, dtype=np.uint8)
-            image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
-            
-            if image is None:
-                raise ValueError("Invalid image data")
-            feature_vector = extract_features_func(image).tolist()
-            new_feature_vectors.append(feature_vector)
+            try:
+                image_data = base64.b64decode(base64_str)
+                np_image = np.frombuffer(image_data, dtype=np.uint8)
+                image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
+                
+                if image is None:
+                    raise ValueError("Invalid image data")
+                feature_vector = extract_features_func(image).tolist()
+                new_feature_vectors.append(feature_vector)
 
-            unique_id = str(uuid4())
-            unique_ids.append(unique_id)
-            record = {"feature_vector": feature_vector, "unique_id": unique_id}
-            stored_data.append(record)
-        feature_vectors.extend(new_feature_vectors)
-        kmeans.partial_fit(feature_vectors)
-        cluster_labels = kmeans.predict(feature_vectors)
+                unique_id = str(uuid4())
+                unique_ids.append(unique_id)
+                record = {"feature_vector": feature_vector, "unique_id": unique_id}
+                stored_data.append(record)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error processing an image: {str(e)}")
 
-        for i, unique_id in enumerate(unique_ids):
-            feature_vector_collection.update_one(
-                {"unique_id": unique_id},
-                {"$set": {"cluster": int(cluster_labels[i])}},
-                upsert=True
-            )
+        # Step 3: Update clustering
+        try:
+            feature_vectors.extend(new_feature_vectors)
+            kmeans.partial_fit(feature_vectors)
+            cluster_labels = kmeans.predict(feature_vectors)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error during clustering: {str(e)}")
 
-        for record, cluster_label in zip(stored_data, cluster_labels[-len(new_feature_vectors):]):
-            record["cluster"] = int(cluster_label)
-        cluster_vectors = {i: [] for i in range(kmeans.n_clusters)}
-        for vector, label in zip(feature_vectors, cluster_labels):
-            cluster_vectors[label].append(vector)
-
-        mean_vectors = {}
-        for cluster, vectors in cluster_vectors.items():
-            if vectors:
-                mean_vector = np.mean(vectors, axis=0).tolist()
-                mean_vectors[cluster] = mean_vector
-                cluster_means_collection.update_one(
-                    {"cluster": cluster},
-                    {"$set": {"mean_feature_vector": mean_vector}},
+        # Step 4: Update database with clustering results
+        try:
+            for i, unique_id in enumerate(unique_ids):
+                feature_vector_collection.update_one(
+                    {"unique_id": unique_id},
+                    {"$set": {"cluster": int(cluster_labels[i])}},
                     upsert=True
                 )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error updating database records: {str(e)}")
+
+        # Step 5: Update cluster means
+        try:
+            cluster_vectors = {i: [] for i in range(kmeans.n_clusters)}
+            for vector, label in zip(feature_vectors, cluster_labels):
+                cluster_vectors[label].append(vector)
+
+            for cluster, vectors in cluster_vectors.items():
+                if vectors:
+                    mean_vector = np.mean(vectors, axis=0).tolist()
+                    cluster_means_collection.update_one(
+                        {"cluster": cluster},
+                        {"$set": {"mean_feature_vector": mean_vector}},
+                        upsert=True
+                    )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error updating cluster means: {str(e)}")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing images: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
     return {
         "message": "Images processed, clustered, and data stored successfully",
