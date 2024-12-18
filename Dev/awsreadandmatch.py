@@ -21,7 +21,7 @@ from glob import glob
 kmeans = MiniBatchKMeans(n_clusters=3, random_state=42, batch_size=100)
 app = FastAPI()
 client = MongoClient("mongodb+srv://anirvesh:anirvesh@cluster0.tuw5ikl.mongodb.net")
-db = client["image_database"]
+db = client["snap-sort"]
 feature_vector_collection = db["image_feature_vectors"]
 cluster_means_collection = db["cluster_means"]
 
@@ -107,7 +107,6 @@ async def match_faces(request: FaceMatchingRequest):
             for file in os.listdir(local_directory_path)
             if file.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))
         ]
-
         matches = {}
         with ThreadPoolExecutor() as executor:
             futures = [
@@ -192,13 +191,13 @@ async def match_faces(request: FaceMatchingRequest):
 #         "stored_data": stored_data
 #     }
 
-
 @app.post("/upload_images")
 async def upload_images(data: ImageData):
     if not data.base64_images:
         raise HTTPException(status_code=400, detail="No images provided")
     else:
-        print("data recieved")
+        print("Data received.")
+
     stored_data = []
 
     try:
@@ -217,11 +216,13 @@ async def upload_images(data: ImageData):
                 image_data = base64.b64decode(base64_str)
                 np_image = np.frombuffer(image_data, dtype=np.uint8)
                 image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
-                
                 if image is None:
                     raise ValueError("Invalid image data")
-                
+                box=localize_faces_func(image)
+                x, y, w, h = box[0]
+                image = image[y:y+h, x:x+w]
                 feature_vector = extract_features_func(image)
+                
                 new_feature_vectors.append(feature_vector)
 
                 unique_id = str(uuid4())
@@ -241,10 +242,22 @@ async def upload_images(data: ImageData):
 
         # Step 4: Update database with clustering results
         try:
-            for i, unique_id in enumerate(unique_ids):
+            # Update existing records with their cluster labels
+            for i, record in enumerate(all_records):
                 feature_vector_collection.update_one(
-                    {"unique_id": unique_id},
+                    {"unique_id": record["unique_id"]},
                     {"$set": {"cluster": int(cluster_labels[i])}},
+                    upsert=True
+                )
+
+            # Add new records with their cluster labels
+            for i, record in enumerate(stored_data):
+                feature_vector_collection.update_one(
+                    {"unique_id": record["unique_id"]},
+                    {"$set": {
+                        "feature_vector": record["feature_vector"],
+                        "cluster": int(cluster_labels[len(all_records) + i])
+                    }},
                     upsert=True
                 )
         except Exception as e:
