@@ -1,7 +1,5 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import boto3
-from botocore.exceptions import NoCredentialsError
 import cv2
 import numpy as np
 from io import BytesIO
@@ -10,20 +8,38 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List
 from uuid import uuid4
 from pymongo import MongoClient
-from ultralytics import YOLO
-from deepface.DeepFace import represent
+#from ultralytics import YOLO
+#from deepface.DeepFace import represent
 import base64
 import io
 from sklearn.cluster import MiniBatchKMeans
 import bcrypt
-import jwt
+from jose import jwt
 from datetime import datetime, timedelta
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 
 
+
+def YOLO(a):
+    pass
+def represent(a):
+    pass
+def boto3(a):
+    pass
+def NoCredentialsError(a):
+    pass
 kmeans = MiniBatchKMeans(n_clusters=3, random_state=42, batch_size=100)
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 client = MongoClient("mongodb+srv://anirvesh:anirvesh@cluster0.tuw5ikl.mongodb.net")
-db = client["image_database"]
+db = client["snap-sort"]
 feature_vector_collection = db["image_feature_vectors"]
 cluster_means_collection = db["cluster_means"]
 users_collection = db["users"]
@@ -42,6 +58,15 @@ class RegisterUser(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+class User(BaseModel):
+    email: str
+    name: Optional[str] = None
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user: User
 
 class FaceMatchingRequest(BaseModel):
     aws_access_key: str
@@ -229,11 +254,11 @@ def register_user(user: RegisterUser):
 
     if users_collection.find_one({"email": user.email}):
         raise HTTPException(status_code=400, detail="Email already registered.")
-
+    hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
     user_data = {
         "name": user.name,
         "email": user.email,
-        "password": user.password,
+        "password": hashed_password.decode('utf-8'),
         "image": user.image,
     }
     result = users_collection.insert_one(user_data)
@@ -253,26 +278,17 @@ def create_access_token(data: dict, expires_delta: timedelta = timedelta(minutes
 
 
 
-@app.post("/login")
+@app.post("/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
     user = users_collection.find_one({"email": request.email})
-    
     if user is None:
         raise HTTPException(status_code=400, detail="Invalid email or password")
-    
     if not bcrypt.checkpw(request.password.encode('utf-8'), user["password"].encode('utf-8')):
         raise HTTPException(status_code=400, detail="Invalid email or password")
-    
     access_token = create_access_token(data={"sub": user["email"]})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.get("/protected")
-async def protected_route(token: str):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email = payload.get("sub")
-        if email is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return {"message": f"Hello {email}, you're authenticated!"}
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    user_response = User(email=user["email"], name=user.get("name", ""))
+    return LoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=user_response
+    )

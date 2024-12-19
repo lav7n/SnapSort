@@ -1,30 +1,36 @@
 // components/LoginForm.js
 import React, { useState } from "react";
 import axios from "axios";
+import { useContext } from 'react';
+import { AuthContext } from '../context/AuthContext';
+
 
 const LoginForm = () => {
+  const { login } = useContext(AuthContext); 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
 
   const handleLogin = async (e) => {
     e.preventDefault();
+
     try {
-      // Sending POST request to the FastAPI backend
-      const response = await axios.post("http://localhost:8000/login", {
+      const response = await axios.post('http://127.0.0.1:8000/login', {
         email,
         password,
       });
 
-      // On success, store the JWT token in localStorage
-      const { access_token } = response.data;
-      localStorage.setItem("access_token", access_token);  // Store token in localStorage
-
-      console.log("Login successful:", response.data);
-      // Redirect user to dashboard or another page on successful login
-      // Example: window.location.href = "/dashboard";
+      const { access_token, user } = response.data;
+      if (access_token && user) {
+        login(access_token, user);  // Call the login function from AuthContext
+        console.log('Login successful:', user);
+        window.location.href = '/dashboard'; // Redirect to dashboard
+      } else {
+        setError('Invalid login response.');
+      }
     } catch (err) {
-      setError("Invalid email or password.");
+      console.error(err);
+      setError('Invalid email or password.');
     }
   };
 

@@ -1,33 +1,30 @@
-// App.js
-import React, { useState } from "react";
-import "./App.css"; // Create appropriate styles in App.css
-import LoginForm from "./components/LoginForm";
-import RegisterForm from "./components/RegisterForm";
+// src/App.js
+import React from "react";
+import "./App.css";
+import { BrowserRouter as Router, Route, Routes } from "react-router-dom";
+import Dashboard from "./pages/Dashboard";
+import ProtectedRoute from "./context/ProtectedRoute";
+import LoginAndRegister from "./pages/LoginAndRegister";
 
 function App() {
-  const [isLogin, setIsLogin] = useState(true);
-
   return (
-    <div className="App">
-      <div className="container">
-        <div className="form-toggle">
-          <button
-            className={isLogin ? "active" : ""}
-            onClick={() => setIsLogin(true)}
-          >
-            Login
-          </button>
-          <button
-            className={!isLogin ? "active" : ""}
-            onClick={() => setIsLogin(false)}
-          >
-            Register
-          </button>
+    <Router>
+      <div className="App">
+        <div className="container">
+          <Routes>
+            <Route path="/loginandregister" element={<LoginAndRegister />} />
+            <Route
+              path="/dashboard"
+              element={
+                <ProtectedRoute>
+                  <Dashboard />
+                </ProtectedRoute>
+              }
+            />
+          </Routes>
         </div>
-
-        {isLogin ? <LoginForm /> : <RegisterForm />}
       </div>
-    </div>
+    </Router>
   );
 }
 
