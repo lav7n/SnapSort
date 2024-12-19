@@ -1,12 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-
 import cv2
 import numpy as np
 from io import BytesIO
 from scipy.spatial.distance import cosine
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import List, Optional
 from uuid import uuid4
 from pymongo import MongoClient
 from ultralytics import YOLO
@@ -14,20 +13,39 @@ from deepface.DeepFace import represent
 import base64
 import io
 from sklearn.cluster import MiniBatchKMeans
+import bcrypt
+from jose import jwt
+from datetime import datetime, timedelta
+from fastapi.middleware.cors import CORSMiddleware
 import os
-from glob import glob
 
-
-kmeans = MiniBatchKMeans(n_clusters=3, random_state=42, batch_size=100)
+# Initialize FastAPI app
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# MongoDB setup
 client = MongoClient("mongodb+srv://anirvesh:anirvesh@cluster0.tuw5ikl.mongodb.net")
 db = client["snap-sort"]
 feature_vector_collection = db["image_feature_vectors"]
 cluster_means_collection = db["cluster_means"]
+users_collection = db["users"]
 
+# Constants
+SECRET_KEY = "your_secret_key_here"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
+# YOLO model
 model = YOLO("model.pt")
+kmeans = MiniBatchKMeans(n_clusters=3, random_state=42, batch_size=100)
 
+# Pydantic models
 class FaceMatchingRequest(BaseModel):
     local_directory: str
     similarity_threshold: float
@@ -35,6 +53,26 @@ class FaceMatchingRequest(BaseModel):
 class ImageData(BaseModel):
     base64_images: List[str]
 
+class RegisterUser(BaseModel):
+    name: str
+    email: str
+    password: str
+    image: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class User(BaseModel):
+    email: str
+    name: Optional[str] = None
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user: User
+
+# Helper functions
 def localize_faces_func(image):
     results = model.predict(source=image, conf=0.25)
     face_boxes = []
@@ -44,9 +82,8 @@ def localize_faces_func(image):
     return face_boxes
 
 def extract_features_func(face_image):
-    result = represent(face_image, model_name="VGG-Face", enforce_detection=False,align=True)
-    return(result[0]["embedding"])
-
+    result = represent(face_image, model_name="VGG-Face", enforce_detection=False, align=True)
+    return result[0]["embedding"]
 
 def process_image(file_key, feature_dict, similarity_threshold):
     try:
@@ -89,13 +126,12 @@ def process_image(file_key, feature_dict, similarity_threshold):
         print(f"Error processing image {file_key}: {e}")
         return None
 
-
+# Routes
 @app.post("/match_faces")
 async def match_faces(request: FaceMatchingRequest):
     try:
         feature_vector_collection_as_dict = {}
         for document in feature_vector_collection.find():
-            print(document)
             feature_vector = tuple(document["feature_vector"])
             unique_id = document["unique_id"]
             cluster_number = document["cluster"]
@@ -107,12 +143,12 @@ async def match_faces(request: FaceMatchingRequest):
             for file in os.listdir(local_directory_path)
             if file.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))
         ]
+
         matches = {}
         with ThreadPoolExecutor() as executor:
             futures = [
                 executor.submit(
-                    process_image, file_path,
-                    feature_vector_collection_as_dict, request.similarity_threshold
+                    process_image, file_path, feature_vector_collection_as_dict, request.similarity_threshold
                 )
                 for file_path in image_files
             ]
@@ -129,161 +165,110 @@ async def match_faces(request: FaceMatchingRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
-# @app.post("/upload_images")
-# async def upload_images(data: ImageData):
-#     if not data.base64_images:
-#         raise HTTPException(status_code=400, detail="No images provided")
-#     stored_data = []
-
-#     try:
-#         all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
-#         feature_vectors = [record["feature_vector"] for record in all_records]
-#         unique_ids = [record["unique_id"] for record in all_records]
-
-#         new_feature_vectors = []
-#         for base64_str in data.base64_images:
-#             image_data = base64.b64decode(base64_str)
-#             np_image = np.frombuffer(image_data, dtype=np.uint8)
-#             image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
-            
-#             if image is None:
-#                 raise ValueError("Invalid image data")
-#             feature_vector = extract_features_func(image).tolist()
-#             new_feature_vectors.append(feature_vector)
-
-#             unique_id = str(uuid4())
-#             unique_ids.append(unique_id)
-#             record = {"feature_vector": feature_vector, "unique_id": unique_id}
-#             stored_data.append(record)
-#         feature_vectors.extend(new_feature_vectors)
-#         kmeans.partial_fit(feature_vectors)
-#         cluster_labels = kmeans.predict(feature_vectors)
-
-#         for i, unique_id in enumerate(unique_ids):
-#             feature_vector_collection.update_one(
-#                 {"unique_id": unique_id},
-#                 {"$set": {"cluster": int(cluster_labels[i])}},
-#                 upsert=True
-#             )
-
-#         for record, cluster_label in zip(stored_data, cluster_labels[-len(new_feature_vectors):]):
-#             record["cluster"] = int(cluster_label)
-#         cluster_vectors = {i: [] for i in range(kmeans.n_clusters)}
-#         for vector, label in zip(feature_vectors, cluster_labels):
-#             cluster_vectors[label].append(vector)
-
-#         mean_vectors = {}
-#         for cluster, vectors in cluster_vectors.items():
-#             if vectors:
-#                 mean_vector = np.mean(vectors, axis=0).tolist()
-#                 mean_vectors[cluster] = mean_vector
-#                 cluster_means_collection.update_one(
-#                     {"cluster": cluster},
-#                     {"$set": {"mean_feature_vector": mean_vector}},
-#                     upsert=True
-#                 )
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Error processing images: {str(e)}")
-
-#     return {
-#         "message": "Images processed, clustered, and data stored successfully",
-#         "stored_data": stored_data
-#     }
-
 @app.post("/upload_images")
 async def upload_images(data: ImageData):
     if not data.base64_images:
         raise HTTPException(status_code=400, detail="No images provided")
-    else:
-        print("Data received.")
 
     stored_data = []
 
     try:
-        # Step 1: Fetch existing records from the database
-        try:
-            all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
-            feature_vectors = [record["feature_vector"] for record in all_records]
-            unique_ids = [record["unique_id"] for record in all_records]
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error fetching records from database: {str(e)}")
+        all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
+        feature_vectors = [record["feature_vector"] for record in all_records]
+        unique_ids = [record["unique_id"] for record in all_records]
 
-        # Step 2: Process incoming images
         new_feature_vectors = []
         for base64_str in data.base64_images:
-            try:
-                image_data = base64.b64decode(base64_str)
-                np_image = np.frombuffer(image_data, dtype=np.uint8)
-                image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
-                if image is None:
-                    raise ValueError("Invalid image data")
-                box=localize_faces_func(image)
-                x, y, w, h = box[0]
-                image = image[y:y+h, x:x+w]
-                feature_vector = extract_features_func(image)
-                
-                new_feature_vectors.append(feature_vector)
+            image_data = base64.b64decode(base64_str)
+            np_image = np.frombuffer(image_data, dtype=np.uint8)
+            image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
 
-                unique_id = str(uuid4())
-                unique_ids.append(unique_id)
-                record = {"feature_vector": feature_vector, "unique_id": unique_id}
-                stored_data.append(record)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Error processing an image: {str(e)}")
+            if image is None:
+                raise ValueError("Invalid image data")
+            box = localize_faces_func(image)
+            x, y, w, h = box[0]
+            image = image[y:y+h, x:x+w]
+            feature_vector = extract_features_func(image)
 
-        # Step 3: Update clustering
-        try:
-            feature_vectors.extend(new_feature_vectors)
-            kmeans.partial_fit(feature_vectors)
-            cluster_labels = kmeans.predict(feature_vectors)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error during clustering: {str(e)}")
+            new_feature_vectors.append(feature_vector)
 
-        # Step 4: Update database with clustering results
-        try:
-            # Update existing records with their cluster labels
-            for i, record in enumerate(all_records):
-                feature_vector_collection.update_one(
-                    {"unique_id": record["unique_id"]},
-                    {"$set": {"cluster": int(cluster_labels[i])}},
+            unique_id = str(uuid4())
+            unique_ids.append(unique_id)
+            record = {"feature_vector": feature_vector, "unique_id": unique_id}
+            stored_data.append(record)
+
+        feature_vectors.extend(new_feature_vectors)
+        kmeans.partial_fit(feature_vectors)
+        cluster_labels = kmeans.predict(feature_vectors)
+
+        for i, unique_id in enumerate(unique_ids):
+            feature_vector_collection.update_one(
+                {"unique_id": unique_id},
+                {"$set": {"cluster": int(cluster_labels[i])}},
+                upsert=True
+            )
+
+        for record, cluster_label in zip(stored_data, cluster_labels[-len(new_feature_vectors):]):
+            record["cluster"] = int(cluster_label)
+
+        cluster_vectors = {i: [] for i in range(kmeans.n_clusters)}
+        for vector, label in zip(feature_vectors, cluster_labels):
+            cluster_vectors[label].append(vector)
+
+        for cluster, vectors in cluster_vectors.items():
+            if vectors:
+                mean_vector = np.mean(vectors, axis=0).tolist()
+                cluster_means_collection.update_one(
+                    {"cluster": cluster},
+                    {"$set": {"mean_feature_vector": mean_vector}},
                     upsert=True
                 )
-
-            # Add new records with their cluster labels
-            for i, record in enumerate(stored_data):
-                feature_vector_collection.update_one(
-                    {"unique_id": record["unique_id"]},
-                    {"$set": {
-                        "feature_vector": record["feature_vector"],
-                        "cluster": int(cluster_labels[len(all_records) + i])
-                    }},
-                    upsert=True
-                )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error updating database records: {str(e)}")
-
-        # Step 5: Update cluster means
-        try:
-            cluster_vectors = {i: [] for i in range(kmeans.n_clusters)}
-            for vector, label in zip(feature_vectors, cluster_labels):
-                cluster_vectors[label].append(vector)
-
-            for cluster, vectors in cluster_vectors.items():
-                if vectors:
-                    mean_vector = np.mean(vectors, axis=0).tolist()
-                    cluster_means_collection.update_one(
-                        {"cluster": cluster},
-                        {"$set": {"mean_feature_vector": mean_vector}},
-                        upsert=True
-                    )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error updating cluster means: {str(e)}")
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing images: {str(e)}")
 
     return {
         "message": "Images processed, clustered, and data stored successfully",
         "stored_data": stored_data
     }
+
+@app.post("/register")
+def register_user(user: RegisterUser):
+    if users_collection.find_one({"email": user.email}):
+        raise HTTPException(status_code=400, detail="Email already registered.")
+
+    hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
+    user_data = {
+        "name": user.name,
+        "email": user.email,
+        "password": hashed_password.decode('utf-8'),
+        "image": user.image,
+    }
+    result = users_collection.insert_one(user_data)
+    return {
+        "id": str(result.inserted_id),
+        "name": user.name,
+        "email": user.email,
+    }
+
+def create_access_token(data: dict, expires_delta: timedelta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + expires_delta
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+@app.post("/login", response_model=LoginResponse)
+async def login(request: LoginRequest):
+    user = users_collection.find_one({"email": request.email})
+    if user is None:
+        raise HTTPException(status_code=400, detail="Invalid email or password")
+    if not bcrypt.checkpw(request.password.encode('utf-8'), user["password"].encode('utf-8')):
+        raise HTTPException(status_code=400, detail="Invalid email or password")
+    access_token = create_access_token(data={"sub": user["email"]})
+    user_response = User(email=user["email"], name=user.get("name", ""))
+    return LoginResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user=user_response
+    )
