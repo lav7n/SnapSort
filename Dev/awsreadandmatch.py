@@ -165,34 +165,39 @@ async def match_faces(request: FaceMatchingRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
-@app.post("/upload_images")
-async def upload_images(data: ImageData):
-    if not data.base64_images:
-        raise HTTPException(status_code=400, detail="No images provided")
-
+@app.post("/process_user_images")
+async def process_user_images():
     stored_data = []
 
     try:
+        user_records = list(users_collection.find({}, {"_id": 0, "image": 1, "id": 1}))
+        if not user_records:
+            raise HTTPException(status_code=400, detail="No users or images found")
+
         all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
         feature_vectors = [record["feature_vector"] for record in all_records]
         unique_ids = [record["unique_id"] for record in all_records]
 
         new_feature_vectors = []
-        for base64_str in data.base64_images:
+        for user in user_records:
+            unique_id = user["unique_id"]
+            if unique_id in unique_ids:
+                continue
+
+            base64_str = user["image"]
             image_data = base64.b64decode(base64_str)
             np_image = np.frombuffer(image_data, dtype=np.uint8)
             image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
 
             if image is None:
-                raise ValueError("Invalid image data")
+                raise ValueError(f"Invalid image data for user ID {unique_id}")
+
             box = localize_faces_func(image)
             x, y, w, h = box[0]
             image = image[y:y+h, x:x+w]
             feature_vector = extract_features_func(image)
 
             new_feature_vectors.append(feature_vector)
-
-            unique_id = str(uuid4())
             unique_ids.append(unique_id)
             record = {"feature_vector": feature_vector, "unique_id": unique_id}
             stored_data.append(record)
@@ -225,10 +230,10 @@ async def upload_images(data: ImageData):
                 )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing images: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing user images: {str(e)}")
 
     return {
-        "message": "Images processed, clustered, and data stored successfully",
+        "message": "User images processed, clustered, and data stored successfully",
         "stored_data": stored_data
     }
 
@@ -236,9 +241,10 @@ async def upload_images(data: ImageData):
 def register_user(user: RegisterUser):
     if users_collection.find_one({"email": user.email}):
         raise HTTPException(status_code=400, detail="Email already registered.")
-
     hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
+    user_id = str(uuid4())
     user_data = {
+        "id": user_id,
         "name": user.name,
         "email": user.email,
         "password": hashed_password.decode('utf-8'),
@@ -246,7 +252,7 @@ def register_user(user: RegisterUser):
     }
     result = users_collection.insert_one(user_data)
     return {
-        "id": str(result.inserted_id),
+        "id": user_id,
         "name": user.name,
         "email": user.email,
     }
