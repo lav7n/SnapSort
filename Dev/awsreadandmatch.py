@@ -145,20 +145,15 @@ async def match_faces(request: FaceMatchingRequest):
         ]
 
         matches = {}
-        with ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(
-                    process_image, file_path, feature_vector_collection_as_dict, request.similarity_threshold
-                )
-                for file_path in image_files
-            ]
-            for future in futures:
-                result = future.result()
-                if result:
-                    for person_id, file_keys in result.items():
-                        if person_id not in matches:
-                            matches[person_id] = []
-                        matches[person_id].extend(file_keys)
+        for file_path in image_files:
+            result = process_image(file_path, feature_vector_collection_as_dict, request.similarity_threshold)
+            if result:
+                for person_id, file_keys in result.items():
+                    if person_id not in matches:
+                        matches[person_id] = []
+                    matches[person_id].extend([i['file_key']for i in file_keys])
+                    matches[person_id].extend([i['file_key']for i in file_keys])
+
 
         return {"matches": matches}
 
@@ -180,15 +175,16 @@ async def process_user_images():
 
         new_feature_vectors = []
         for user in user_records:
-            unique_id = user["unique_id"]
+            unique_id = user["id"]
             if unique_id in unique_ids:
                 continue
 
             base64_str = user["image"]
+            if base64_str.startswith("data:image/"):
+                base64_str = base64_str.split(",")[1]
             image_data = base64.b64decode(base64_str)
             np_image = np.frombuffer(image_data, dtype=np.uint8)
             image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
-
             if image is None:
                 raise ValueError(f"Invalid image data for user ID {unique_id}")
 
@@ -215,6 +211,16 @@ async def process_user_images():
 
         for record, cluster_label in zip(stored_data, cluster_labels[-len(new_feature_vectors):]):
             record["cluster"] = int(cluster_label)
+            feature_vector_collection.update_one(
+                {"unique_id": record["unique_id"]},
+                {
+                    "$set": {
+                        "feature_vector": record["feature_vector"],
+                        "cluster": record["cluster"]
+                    }
+                },
+                upsert=True
+            )
 
         cluster_vectors = {i: [] for i in range(kmeans.n_clusters)}
         for vector, label in zip(feature_vectors, cluster_labels):
@@ -236,6 +242,8 @@ async def process_user_images():
         "message": "User images processed, clustered, and data stored successfully",
         "stored_data": stored_data
     }
+
+
 
 @app.post("/register")
 def register_user(user: RegisterUser):
