@@ -1,7 +1,6 @@
 
 import React, { useState } from "react";
-import LoginForm from "../components/LoginForm";
-import RegisterForm from "../components/RegisterForm";
+import AuthForm from "../components/AuthForm";
 
 const LoginAndRegister = () => {
   const [isLogin, setIsLogin] = useState(true);
@@ -23,7 +22,7 @@ const LoginAndRegister = () => {
         </button>
       </div>
 
-      {isLogin ? <LoginForm /> : <RegisterForm />}
+      {isLogin ? <AuthForm type="sign-up" /> : <AuthForm type="sign-in" />}
     </div>
   );
 };
