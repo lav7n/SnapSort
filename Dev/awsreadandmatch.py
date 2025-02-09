@@ -12,7 +12,6 @@ from ultralytics import YOLO
 from deepface.DeepFace import represent
 import base64
 import io
-from sklearn.cluster import MiniBatchKMeans
 import bcrypt
 from jose import jwt
 from datetime import datetime, timedelta
@@ -33,7 +32,6 @@ app.add_middleware(
 client = MongoClient("mongodb+srv://anirvesh:anirvesh@cluster0.tuw5ikl.mongodb.net")
 db = client["snap-sort"]
 feature_vector_collection = db["image_feature_vectors"]
-cluster_means_collection = db["cluster_means"]
 users_collection = db["users"]
 
 # Constants
@@ -43,7 +41,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # YOLO model
 model = YOLO("model.pt")
-kmeans = MiniBatchKMeans(n_clusters=3, random_state=42, batch_size=100)
 
 # Pydantic models
 class FaceMatchingRequest(BaseModel):
@@ -99,34 +96,22 @@ def process_image(file_key, feature_dict, similarity_threshold):
             face_image = image[y:y+h, x:x+w]
             face_vector = extract_features_func(face_image)
 
-            closest_cluster = None
-            min_distance = float('inf')
-            for cluster in cluster_means_collection.find():
-                mean_vector = cluster["mean_feature_vector"]
-                distance = np.linalg.norm(np.array(face_vector) - np.array(mean_vector))
-                if distance < min_distance:
-                    min_distance = distance
-                    closest_cluster = cluster["cluster"]
-
-            for known_vector, (person_id, cluster_id) in feature_dict.items():
-                if cluster_id == closest_cluster:
-                    similarity = 1 - cosine(face_vector, known_vector)
-                    if similarity >= similarity_threshold:
-                        if person_id not in image_matches:
-                            image_matches[person_id] = []
-                        image_matches[person_id].append({
-                            "file_key": file_key,
-                            "bounding_box": box,
-                            "similarity": similarity,
-                            "cluster": closest_cluster
-                        })
+            for known_vector, person_id in feature_dict.items():
+                similarity = 1 - cosine(face_vector, known_vector)
+                if similarity >= similarity_threshold:
+                    if person_id not in image_matches:
+                        image_matches[person_id] = []
+                    image_matches[person_id].append({
+                        "file_key": file_key,
+                        "bounding_box": box,
+                        "similarity": similarity
+                    })
         return image_matches
 
     except Exception as e:
         print(f"Error processing image {file_key}: {e}")
         return None
 
-# Routes
 @app.post("/match_faces")
 async def match_faces(request: FaceMatchingRequest):
     try:
@@ -134,8 +119,7 @@ async def match_faces(request: FaceMatchingRequest):
         for document in feature_vector_collection.find():
             feature_vector = tuple(document["feature_vector"])
             unique_id = document["unique_id"]
-            cluster_number = document["cluster"]
-            feature_vector_collection_as_dict[feature_vector] = (unique_id, cluster_number)
+            feature_vector_collection_as_dict[feature_vector] = unique_id
 
         local_directory_path = "queue"
         image_files = [
@@ -151,9 +135,7 @@ async def match_faces(request: FaceMatchingRequest):
                 for person_id, file_keys in result.items():
                     if person_id not in matches:
                         matches[person_id] = []
-                    matches[person_id].extend([i['file_key']for i in file_keys])
-                    matches[person_id].extend([i['file_key']for i in file_keys])
-
+                    matches[person_id].extend([i['file_key'] for i in file_keys])
 
         return {"matches": matches}
 
@@ -172,7 +154,7 @@ async def process_user_images():
         all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
         feature_vectors = [record["feature_vector"] for record in all_records]
         unique_ids = [record["unique_id"] for record in all_records]
-
+        
         new_feature_vectors = []
         for user in user_records:
             unique_id = user["id"]
@@ -198,52 +180,20 @@ async def process_user_images():
             record = {"feature_vector": feature_vector, "unique_id": unique_id}
             stored_data.append(record)
 
-        feature_vectors.extend(new_feature_vectors)
-        kmeans.partial_fit(feature_vectors)
-        cluster_labels = kmeans.predict(feature_vectors)
-
-        for i, unique_id in enumerate(unique_ids):
-            feature_vector_collection.update_one(
-                {"unique_id": unique_id},
-                {"$set": {"cluster": int(cluster_labels[i])}},
-                upsert=True
-            )
-
-        for record, cluster_label in zip(stored_data, cluster_labels[-len(new_feature_vectors):]):
-            record["cluster"] = int(cluster_label)
+        for record in stored_data:
             feature_vector_collection.update_one(
                 {"unique_id": record["unique_id"]},
-                {
-                    "$set": {
-                        "feature_vector": record["feature_vector"],
-                        "cluster": record["cluster"]
-                    }
-                },
+                {"$set": {"feature_vector": record["feature_vector"]}},
                 upsert=True
             )
-
-        cluster_vectors = {i: [] for i in range(kmeans.n_clusters)}
-        for vector, label in zip(feature_vectors, cluster_labels):
-            cluster_vectors[label].append(vector)
-
-        for cluster, vectors in cluster_vectors.items():
-            if vectors:
-                mean_vector = np.mean(vectors, axis=0).tolist()
-                cluster_means_collection.update_one(
-                    {"cluster": cluster},
-                    {"$set": {"mean_feature_vector": mean_vector}},
-                    upsert=True
-                )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing user images: {str(e)}")
 
     return {
-        "message": "User images processed, clustered, and data stored successfully",
+        "message": "User images processed and data stored successfully",
         "stored_data": stored_data
     }
-
-
 
 @app.post("/register")
 def register_user(user: RegisterUser):
