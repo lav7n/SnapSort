@@ -17,6 +17,10 @@ from jose import jwt
 from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import faiss
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -70,6 +74,10 @@ class LoginResponse(BaseModel):
     user: User
 
 # Helper functions
+
+
+
+
 def localize_faces_func(image):
     results = model.predict(source=image, conf=0.25)
     face_boxes = []
@@ -82,7 +90,41 @@ def extract_features_func(face_image):
     result = represent(face_image, model_name="VGG-Face", enforce_detection=False, align=True)
     return result[0]["embedding"]
 
-def process_image(file_key, feature_dict, similarity_threshold):
+
+
+
+dimension = 4096
+index = faiss.IndexFlatIP(dimension)
+
+def normalize_vectors(vectors):
+    """Normalize vectors to unit length for cosine similarity."""
+    norms = np.linalg.norm(vectors, axis=1)
+    normalized_vectors = vectors / np.maximum(norms[:, np.newaxis], 1e-10)
+    return normalized_vectors.astype('float32')
+
+def initialize_faiss_index():
+    """Initialize FAISS index with existing vectors from MongoDB."""
+    global index
+    
+    # Fetch all feature vectors from MongoDB
+    all_records = list(feature_vector_collection.find({}, {"feature_vector": 1}))
+    if not all_records:
+        return
+    
+    # Convert to numpy array and normalize
+    vectors = np.array([record["feature_vector"] for record in all_records])
+    normalized_vectors = normalize_vectors(vectors)
+    
+    # Reset and rebuild index
+    index = faiss.IndexFlatIP(dimension)
+    index.add(normalized_vectors)
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize FAISS index when the application starts."""
+    initialize_faiss_index()
+
+def process_image(file_key, similarity_threshold):
     try:
         image = cv2.imread(file_key)
         if image is None:
@@ -91,56 +133,36 @@ def process_image(file_key, feature_dict, similarity_threshold):
 
         bounding_boxes = localize_faces_func(image)
         image_matches = {}
+        
+        # Get all feature vectors and their IDs from MongoDB
+        all_records = list(feature_vector_collection.find())
+        
         for box in bounding_boxes:
             x, y, w, h = box
             face_image = image[y:y+h, x:x+w]
-            face_vector = extract_features_func(face_image)
-
-            for known_vector, person_id in feature_dict.items():
-                similarity = 1 - cosine(face_vector, known_vector)
-                if similarity >= similarity_threshold:
+            query_vector = np.array(extract_features_func(face_image))
+            normalized_query = normalize_vectors(query_vector.reshape(1, -1))
+            
+            k = 1 
+            similarities, indices = index.search(normalized_query, k)
+            
+            # Process results
+            for sim, idx in zip(similarities[0], indices[0]):
+                if sim >= similarity_threshold:
+                    person_id = all_records[idx]["unique_id"]
                     if person_id not in image_matches:
                         image_matches[person_id] = []
                     image_matches[person_id].append({
                         "file_key": file_key,
                         "bounding_box": box,
-                        "similarity": similarity
+                        "similarity": float(sim)
                     })
+        
         return image_matches
 
     except Exception as e:
         print(f"Error processing image {file_key}: {e}")
         return None
-
-@app.post("/match_faces")
-async def match_faces(request: FaceMatchingRequest):
-    try:
-        feature_vector_collection_as_dict = {}
-        for document in feature_vector_collection.find():
-            feature_vector = tuple(document["feature_vector"])
-            unique_id = document["unique_id"]
-            feature_vector_collection_as_dict[feature_vector] = unique_id
-
-        local_directory_path = "queue"
-        image_files = [
-            os.path.join(local_directory_path, file)
-            for file in os.listdir(local_directory_path)
-            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))
-        ]
-
-        matches = {}
-        for file_path in image_files:
-            result = process_image(file_path, feature_vector_collection_as_dict, request.similarity_threshold)
-            if result:
-                for person_id, file_keys in result.items():
-                    if person_id not in matches:
-                        matches[person_id] = []
-                    matches[person_id].extend([i['file_key'] for i in file_keys])
-
-        return {"matches": matches}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
 @app.post("/process_user_images")
 async def process_user_images():
@@ -151,41 +173,52 @@ async def process_user_images():
         if not user_records:
             raise HTTPException(status_code=400, detail="No users or images found")
 
+        # Get existing feature vectors and IDs
         all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
-        feature_vectors = [record["feature_vector"] for record in all_records]
-        unique_ids = [record["unique_id"] for record in all_records]
+        existing_ids = {record["unique_id"] for record in all_records}
         
-        new_feature_vectors = []
+        new_vectors = []
+        new_records = []
+        
         for user in user_records:
             unique_id = user["id"]
-            if unique_id in unique_ids:
+            if unique_id in existing_ids:
                 continue
 
+            # Process image and extract features
             base64_str = user["image"]
             if base64_str.startswith("data:image/"):
                 base64_str = base64_str.split(",")[1]
             image_data = base64.b64decode(base64_str)
             np_image = np.frombuffer(image_data, dtype=np.uint8)
             image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
+            
             if image is None:
                 raise ValueError(f"Invalid image data for user ID {unique_id}")
 
             box = localize_faces_func(image)
             x, y, w, h = box[0]
-            image = image[y:y+h, x:x+w]
-            feature_vector = extract_features_func(image)
-
-            new_feature_vectors.append(feature_vector)
-            unique_ids.append(unique_id)
-            record = {"feature_vector": feature_vector, "unique_id": unique_id}
-            stored_data.append(record)
-
-        for record in stored_data:
+            face_image = image[y:y+h, x:x+w]
+            feature_vector = extract_features_func(face_image)
+            
+            # Store in MongoDB
+            record = {"feature_vector": np.array(feature_vector).tolist(), "unique_id": unique_id}
             feature_vector_collection.update_one(
-                {"unique_id": record["unique_id"]},
-                {"$set": {"feature_vector": record["feature_vector"]}},
+                {"unique_id": unique_id},
+                {"$set": record},
                 upsert=True
             )
+            
+            # Collect for FAISS update
+            new_vectors.append(feature_vector)
+            new_records.append(record)
+            stored_data.append(record)
+
+        if new_vectors:
+            # Update FAISS index with new vectors
+            new_vectors_array = np.array(new_vectors)
+            normalized_vectors = normalize_vectors(new_vectors_array)
+            index.add(normalized_vectors)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing user images: {str(e)}")
@@ -195,6 +228,29 @@ async def process_user_images():
         "stored_data": stored_data
     }
 
+@app.post("/match_faces")
+async def match_faces(request: FaceMatchingRequest):
+    try:
+        local_directory_path = "queue"
+        image_files = [
+            os.path.join(local_directory_path, file)
+            for file in os.listdir(local_directory_path)
+            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))
+        ]
+
+        matches = {}
+        for file_path in image_files:
+            result = process_image(file_path, request.similarity_threshold)
+            if result:
+                for person_id, file_matches in result.items():
+                    if person_id not in matches:
+                        matches[person_id] = []
+                    matches[person_id].extend([match['file_key'] for match in file_matches])
+
+        return {"matches": matches}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 @app.post("/register")
 def register_user(user: RegisterUser):
     if users_collection.find_one({"email": user.email}):
