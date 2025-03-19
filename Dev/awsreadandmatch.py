@@ -12,14 +12,19 @@ from ultralytics import YOLO
 from deepface.DeepFace import represent
 import base64
 import io
+import random
+import string
 import bcrypt
 from jose import jwt
 from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import faiss
+import requests
 import os
+import json
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 
 
 # Initialize FastAPI app
@@ -35,20 +40,26 @@ app.add_middleware(
 # MongoDB setup
 client = MongoClient("mongodb+srv://anirvesh:anirvesh@cluster0.tuw5ikl.mongodb.net")
 db = client["snap-sort"]
+
 feature_vector_collection = db["image_feature_vectors"]
 users_collection = db["users"]
+events_collection = db["events"]
+
+
+faiss_indices = {}
+dimension = 4096
 
 # Constants
 SECRET_KEY = "your_secret_key_here"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
+CDN_BASE_URL = "https://your-cdn.com/"
+CDN_UPLOAD_URL = "https://your-cdn.com/upload"
 # YOLO model
 model = YOLO("model.pt")
 
 # Pydantic models
 class FaceMatchingRequest(BaseModel):
-    local_directory: str
     similarity_threshold: float
 
 class ImageData(BaseModel):
@@ -75,7 +86,29 @@ class LoginResponse(BaseModel):
 
 # Helper functions
 
+def fetch_image_from_cdn(image_url):
+    """Fetch image from the CDN and return it as a NumPy array."""
+    response = requests.get(image_url)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch image: {image_url}")
+    
+    image_array = np.asarray(bytearray(response.content), dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail=f"Failed to decode image: {image_url}")
+    
+    return image
 
+
+def upload_to_cdn(file_name, json_data):
+    """Uploads JSON file to the CDN."""
+    files = {"file": (file_name, json.dumps(json_data), "application/json")}
+    response = requests.post(CDN_UPLOAD_URL, files=files)
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail="Failed to upload matches.json to CDN")
+
+    return response.json().get("url")  # Assuming CDN returns the file URL
 
 
 def localize_faces_func(image):
@@ -91,44 +124,18 @@ def extract_features_func(face_image):
     return result[0]["embedding"]
 
 
-
-
-dimension = 4096
-index = faiss.IndexFlatIP(dimension)
-
 def normalize_vectors(vectors):
     """Normalize vectors to unit length for cosine similarity."""
     norms = np.linalg.norm(vectors, axis=1)
     normalized_vectors = vectors / np.maximum(norms[:, np.newaxis], 1e-10)
     return normalized_vectors.astype('float32')
 
-def initialize_faiss_index():
-    """Initialize FAISS index with existing vectors from MongoDB."""
-    global index
-    
-    # Fetch all feature vectors from MongoDB
-    all_records = list(feature_vector_collection.find({}, {"feature_vector": 1}))
-    if not all_records:
-        return
-    
-    # Convert to numpy array and normalize
-    vectors = np.array([record["feature_vector"] for record in all_records])
-    normalized_vectors = normalize_vectors(vectors)
-    
-    # Reset and rebuild index
-    index = faiss.IndexFlatIP(dimension)
-    index.add(normalized_vectors)
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize FAISS index when the application starts."""
-    initialize_faiss_index()
-
-def process_image(file_key, similarity_threshold):
+def process_image(file,event_id, similarity_threshold):
+    # file = {image,file_key}
     try:
-        image = cv2.imread(file_key)
+        image = file["image"]
         if image is None:
-            print(f"Failed to read image: {file_key}")
+            print(f"Failed to read image: {file}")
             return None
 
         bounding_boxes = localize_faces_func(image)
@@ -144,16 +151,16 @@ def process_image(file_key, similarity_threshold):
             normalized_query = normalize_vectors(query_vector.reshape(1, -1))
             
             k = 1 
-            similarities, indices = index.search(normalized_query, k)
+            similarities, indices = faiss_indices[event_id].search(normalized_query, k)
             
             # Process results
             for sim, idx in zip(similarities[0], indices[0]):
                 if sim >= similarity_threshold:
-                    person_id = all_records[idx]["unique_id"]
+                    person_id = all_records[idx]["id"]
                     if person_id not in image_matches:
                         image_matches[person_id] = []
                     image_matches[person_id].append({
-                        "file_key": file_key,
+                        "file_key": file["file_key"],
                         "bounding_box": box,
                         "similarity": float(sim)
                     })
@@ -161,100 +168,114 @@ def process_image(file_key, similarity_threshold):
         return image_matches
 
     except Exception as e:
-        print(f"Error processing image {file_key}: {e}")
+        print(f"Error processing image : {e}")
         return None
 
-@app.post("/process_user_images")
-async def process_user_images():
+@app.post("/process_user_images/{event_id}")
+async def process_user_images(event_id: str):
     stored_data = []
-
     try:
-        user_records = list(users_collection.find({}, {"_id": 0, "image": 1, "id": 1}))
+        event = events_collection.find_one({"_id": event_id}, {"participants": 1})
+        if not event or "participants" not in event:
+            raise HTTPException(status_code=400, detail="Event not found or has no participants")
+        
+        user_ids = event["participants"]
+        user_records = list(users_collection.find({"id": {"$in": user_ids}}, {"_id": 0, "image": 1, "id": 1}))
         if not user_records:
-            raise HTTPException(status_code=400, detail="No users or images found")
-
-        # Get existing feature vectors and IDs
-        all_records = list(feature_vector_collection.find({}, {"_id": 0, "feature_vector": 1, "unique_id": 1}))
-        existing_ids = {record["unique_id"] for record in all_records}
+            raise HTTPException(status_code=400, detail="No user images found")
+        
+        all_records = list(feature_vector_collection.find({"id": {"$in": user_ids}}, {"_id": 0, "feature_vector": 1, "id": 1}))
+        existing_ids = {record["id"] for record in all_records}
         
         new_vectors = []
         new_records = []
         
         for user in user_records:
-            unique_id = user["id"]
-            if unique_id in existing_ids:
+            id = user["id"]
+            if id in existing_ids:
                 continue
 
-            # Process image and extract features
-            base64_str = user["image"]
-            if base64_str.startswith("data:image/"):
-                base64_str = base64_str.split(",")[1]
-            image_data = base64.b64decode(base64_str)
-            np_image = np.frombuffer(image_data, dtype=np.uint8)
-            image = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
-            
+            image = user["image"]
             if image is None:
-                raise ValueError(f"Invalid image data for user ID {unique_id}")
-
+                raise ValueError(f"Invalid image data for user ID {id}")
+            
             box = localize_faces_func(image)
             x, y, w, h = box[0]
             face_image = image[y:y+h, x:x+w]
             feature_vector = extract_features_func(face_image)
             
-            # Store in MongoDB
-            record = {"feature_vector": np.array(feature_vector).tolist(), "unique_id": unique_id}
+            record = {"feature_vector": np.array(feature_vector).tolist(), "id": id}
             feature_vector_collection.update_one(
-                {"unique_id": unique_id},
+                {"id": id},
                 {"$set": record},
                 upsert=True
             )
             
-            # Collect for FAISS update
             new_vectors.append(feature_vector)
             new_records.append(record)
             stored_data.append(record)
-
+        
         if new_vectors:
-            # Update FAISS index with new vectors
+            if event_id not in faiss_indices:
+                faiss_indices[event_id] = faiss.IndexFlatIP(dimension)  # Initialize FAISS index if not present
+            
+            index = faiss_indices[event_id]
             new_vectors_array = np.array(new_vectors)
             normalized_vectors = normalize_vectors(new_vectors_array)
             index.add(normalized_vectors)
-
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing user images: {str(e)}")
+    
+    return {"message": "User images processed and data stored successfully", "stored_data": stored_data}
 
-    return {
-        "message": "User images processed and data stored successfully",
-        "stored_data": stored_data
-    }
-
-@app.post("/match_faces")
-async def match_faces(request: FaceMatchingRequest):
+@app.post("/match_faces/{event_id}")
+async def match_faces(event_id: str,request: FaceMatchingRequest):
+    """Match faces from stored images for a specific event from CDN."""
     try:
-        local_directory_path = "queue"
-        image_files = [
-            os.path.join(local_directory_path, file)
-            for file in os.listdir(local_directory_path)
-            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))
-        ]
+        # Construct CDN directory URL
+        event_directory_url = f"{CDN_BASE_URL}{event_id}/"
+
+        # Fetch image file list from CDN (Assuming a JSON API returns file names)
+        response = requests.get(event_directory_url)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Event images directory not found on CDN")
+        
+        image_files = response.json().get("images", [])  # Assuming CDN API returns {"images": ["image1.jpg", "image2.png"]}
 
         matches = {}
-        for file_path in image_files:
-            result = process_image(file_path, request.similarity_threshold)
+
+        for file_name in image_files:
+            image_url = f"{event_directory_url}{file_name}"
+            image = fetch_image_from_cdn(image_url)
+
+            file = {"image": image, "file_key": file_name}
+            result = process_image(file, event_id, request.similarity_threshold)
+
             if result:
                 for person_id, file_matches in result.items():
                     if person_id not in matches:
                         matches[person_id] = []
-                    matches[person_id].extend([match['file_key'] for match in file_matches])
+                    matches[person_id].extend([match['file_path'] for match in file_matches])
+                
 
-        return {"matches": matches}
+        matches_json = {"matches": matches}
+        matches_json_url = upload_to_cdn(f"{request.event_id}/matches.json", matches_json)
+
+        return {
+            "message": "Face matching completed successfully",
+            "matches_file_url": matches_json_url
+        }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+    
 @app.post("/register")
 def register_user(user: RegisterUser):
     if users_collection.find_one({"email": user.email}):
-        raise HTTPException(status_code=400, detail="Email already registered.")
+        raise HTTPException(status_code=400, detail="Email already registered for this event.")
     hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
     user_id = str(uuid4())
     user_data = {
@@ -263,13 +284,10 @@ def register_user(user: RegisterUser):
         "email": user.email,
         "password": hashed_password.decode('utf-8'),
         "image": user.image,
+        "event_ids": []
     }
-    result = users_collection.insert_one(user_data)
-    return {
-        "id": user_id,
-        "name": user.name,
-        "email": user.email,
-    }
+    users_collection.insert_one(user_data)
+    return {"id": user_id, "name": user.name, "email": user.email}
 
 def create_access_token(data: dict, expires_delta: timedelta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)):
     to_encode = data.copy()
@@ -292,3 +310,11 @@ async def login(request: LoginRequest):
         token_type="bearer",
         user=user_response
     )
+
+
+def generate_event_code():
+    return "-".join("".join(random.choices(string.ascii_lowercase + string.digits, k=4)) for _ in range(3))
+
+
+
+
