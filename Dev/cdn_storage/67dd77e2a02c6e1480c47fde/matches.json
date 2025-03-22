@@ -1,0 +1,33 @@
+{
+    "matches": {
+        "67de5cd5be444982b4e71500": [
+            [
+                "IMG-20250322-WA0107.jpg",
+                "IMG-20250322-WA0107.jpg",
+                "IMG-20250322-WA0107.jpg",
+                "IMG-20250322-WA0107.jpg",
+                "IMG-20250322-WA0107.jpg",
+                "IMG-20250322-WA0107.jpg"
+            ],
+            [
+                "resized_output.jpg"
+            ]
+        ],
+        "67de5d10be444982b4e71502": [
+            [
+                "IMG-20250322-WA0107.jpg"
+            ],
+            [
+                "resized_output.jpg",
+                "resized_output.jpg"
+            ]
+        ],
+        "67de5cfdbe444982b4e71501": [
+            [
+                "resized_output.jpg",
+                "resized_output.jpg",
+                "resized_output.jpg"
+            ]
+        ]
+    }
+}
